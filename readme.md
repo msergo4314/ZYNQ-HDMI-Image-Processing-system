@@ -338,15 +338,19 @@ Software rendering performance depends on the amount of framebuffer data modifie
 Compiler optimization also has a significant effect on software rendering performance. The rendering times are as follows:
 
 Frame mode with no optimizations:
+
 ![Optimization_0_FRAME_MODE](/images/Optimization_0_FRAME_MODE.png)
 
 Frame mode with o1 optimizations:
+
 ![Optimization_1_FRAME_MODE](/images/Optimization_1_FRAME_MODE.png)
 
 Incremental mode with no optimizations:
+
 ![Optimization_0_INCREMENTAL_MODE](/images/Optimization_0_INCREMENTAL_MODE.png)
 
 Incremental mode with o1 optimizations:
+
 ![Optimization_1_INCREMENTAL_MODE](/images/Optimization_1_INCREMENTAL_MODE.png)
 
 In general, the incremental drawing mode requires ~30 ms to perform a memcpy operation, so refreshing the display always takes at least that long, plus the time to flush the pixels that have updated since the last frame refresh (up to 13 ms for a full frame). Using the full frame rendering mode avoids the expensive memcpy and always flushes the full frame, so pushing a complete frame takes ~13 ms. As can be seen, the drawing times depend heavily on optimization level, so optimizations should be enabled at at least the o1 level. This reduces frame buffer writes by > 75% regardless of the mode used.
