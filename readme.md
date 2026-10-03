@@ -16,7 +16,7 @@ The graphics API from the LCD project was adapted to operate on DDR-backed VDMA 
 ## Features
 
 - 1920×1080 HDMI output
-- Real-time hardware image processing at the pixel clock rate (148 Mhz for 1080p)
+- Real-time hardware image processing at the pixel clock rate (148.5 Mhz for 1080p)
 - Configurable image transformations implemented in FPGA logic
 - 3×3 convolution-based spatial filtering
 - Line-buffered image processing using FPGA block RAM
@@ -25,7 +25,7 @@ The graphics API from the LCD project was adapted to operate on DDR-backed VDMA 
 - Triple-buffered framebuffer rendering
 - Bare-metal C graphics library for drawing directly into the framebuffer
 - Basic text rendering using LVGL fonts
-- Multiple framebuffer rendering modes to accomodate both full frames and small updates
+- Multiple framebuffer rendering modes to accommodate both full frames and small updates
 - Landscape, inverted landsape, portrait, and inverted portrait display orientations
 - Software-controlled filter selection at runtime
 - PS/PL integration using AXI peripherals
@@ -107,7 +107,7 @@ The video timing is generated for 1080p output with a video timing generator IP 
 
 The framebuffer uses 32-bit pixels even though the image-processing pipeline operates on 24-bit RGB data. This simplifies the software interface and VDMA configuration while providing a convenient word-aligned framebuffer representation (pixels can be treated as uint32_t instead of a raw byte array).
 
-The unused portion of the 32-bit pixel is discarded (sliced) when the pixel enters the axi4 to video out block.
+The unused portion of the 32-bit pixel is discarded (sliced) immediately before the pixel enters the axi4 to video out block.
 
 A pushbutton connected to the PS is used to cycle through the available transformations. The PS debounces the button and updates the transformation-selection GPIO output accordingly. When a new frame is rendered,
 the transformation selection is read to configure various matrices and weights before the pixels come in.
@@ -166,7 +166,7 @@ A A B
 C C D
 ```
 
-Note that since pixel A has no neighbor to the left or above, A is extended to the left and the top row is a duplicate of the current row. This is true for all pixels that form the border of the image and allows the convolution pipeline to process the first and last pixels without requiring special cases in the arithmetic pipeline.
+Note that since pixel A has no neighbor to the left or above, A is extended to the left and the top row is a duplicate of the current row. This is true for all pixels that form the border of the image and allows the convolution pipeline to process the first and last pixels without requiring special cases in the arithmetic stages.
 
 ## Filters
 
@@ -181,7 +181,13 @@ The project currently demonstrates several transformations, including:
 - Horizontal edge detection
 - Vertical edge detection
 
-The convolution-based filters are implemented using configurable kernel coefficients in addition to colour channel contribution matrices and scalar offsets
+Each transformation is described by three sets of parameters:
+
+- **Weights kernel:** a 3×3 matrix controlling how neighbouring pixels contribute to each output channel.
+- **Colour channel matrix:** a 3×3 matrix controlling how the accumulated input R, G, and B channels contribute to each output channel.
+- **Channel offset:** a constant added to each output channel.
+
+This separates spatial filtering from colour transformation. For example, grayscale uses an identity spatial kernel followed by the same weighted RGB combination for all three output channels, while inversion uses an identity spatial transformation with a negative spatial coefficient and a +255 channel offset.
 
 Note that the edge detection filters use a greyscale conversion at the end to make the output less visually noisy.
 
@@ -215,7 +221,7 @@ The library also supports different display orientations by converting user-faci
 
 Text rendering uses font bitmap and glyph-descriptor data generated using LVGL-compatible font structures.
 
-The built-in font data for strings is stored directly in the application rather than being loaded from a filesystem at runtime. however, fonts can still be loaded at any time, as long as they are first converted into C arrays with the LVGL font converter tool.
+The built-in font data for strings is stored directly in the application rather than being loaded from a filesystem at runtime. However, fonts can still be loaded at any time, as long as they are first converted into C arrays with the LVGL font converter tool.
 
 ### Triple Buffering
 
@@ -224,7 +230,7 @@ The graphics library uses three framebuffer regions in DDR memory.
 At any given time, the buffers have three logical states:
 
 ```text
-PARKED -- currently displayed and unavialable to draw in
+PARKED -- currently displayed and unavailable to draw in
 USING -- currently being modified by the CPU
 FREE -- available for future rendering
 ```
@@ -250,30 +256,29 @@ Horizontal shift registers then construct the three-pixel-wide window.
 
 An initial implementation attempted to read three adjacent pixels from a single line-buffer memory on every clock. While this is a simple solution conceptually, it made block-RAM inference difficult because the requested memory behaviour required multiple independent reads from the same memory during one clock cycle.
 
-The final architecture instead reads one pixel from each line buffer per clock and constructs the horizontal window using shift registers. The BRAM reads require one cycle to produce an output.
+The design uses four rotating line buffers. Three buffers provide the rows required for the current 3×3 window while the fourth can be written with incoming pixels. The roles of the buffers rotate as each image row is completed.
 
-### Image processing pipeline
+Only one pixel is read from each required line buffer per clock. Horizontal shift registers then construct the three-pixel-wide window. This avoids requiring multiple simultaneous reads from a single BRAM.
 
-image processing is implemented as follows:
+### Image Processing Pipeline
 
-- input timing is delayed by two lines of stream data to accomodate two line buffers being ready for the first row (normally three rows are needed, but row 0 has no row above it and can be duplicated into the top of the kernel)
-- input pixel data is stored into the line buffers as it streams in
-- line buffers are read based on the delayed display enable signal which ensures the buffers are filled by the time the first output pixel is produced.
+The image-processing pipeline is deeply pipelined so that one pixel can be processed every pixel-clock cycle after the initial pipeline fill.
 
-- stage 1: one cycle delay to allow the read result of the line buffer to be ready
-- stage 2: one cycle delay to register the line buffer output into the side of the kernel
-- stage 3: one cylce of delay to shift the current pixel from the right of the kernel to the center. The previous pixel will have been shifted to the left at this point, except in the case of the first pixel of a row, but in that case the left side of the kernel gets a copy of the middle anyway.
-- stage 4: the kernel values are determined and set based on the row count and pixel count (edge pixels require duplication to avoid using stale/incorrect data)
-- stage 5: individual colour channels are extracted from each pixel in the kernel
-- stage 6: the kernel is multiplied by the weights matrix for the desired filter
-- stage 7: each channel of each pixel is multiplied by the corresponding weight of the filter matrix
-- stages 8-10: adder tree is used to sum the multiplied channels
-- stage 11-12: each colour channel is computed as a linear combination of the three colour channels (multiply then sum values)
-- stage 13: constant offsets are added to each colour channel
-- stage 14: each colour channel is divided by the kernel division value
-- stage 15: colour channels are signed or unsigned depending on the filter
-- stage 16: colour channel values are clamped to the range (0-255)
-- stage 17: colour channels are packed into the output pixel as (r/b/g) along with delayed timing signals
+The major stages are:
+
+1. **Line-buffer access** - Previously received image rows are read from the line buffers.
+2. **Line-buffer registration** - The BRAM output is registered before being used by the kernel-generation logic.
+3. **Horizontal shifting** - Shift registers construct the three-pixel horizontal window for each of the three rows.
+4. **Kernel construction** - The three rows are combined into a 3×3 window. Image-border pixels are duplicated where necessary.
+5. **Colour extraction** - The red, green, and blue channels are extracted from each of the nine kernel pixels.
+6. **Kernel multiplication** - Each channel of each pixel is multiplied by its corresponding convolution coefficient. The 27 multiplications are implemented in parallel and are mapped to DSP resources.
+7. **Adder tree** - The nine products for each colour channel are accumulated over three pipelined stages.
+8. **Colour-channel transformation** - The resulting RGB channel sums are multiplied by a 3×3 colour-channel matrix and accumulated to form the output channels. This allows transformations such as grayscale conversion to be expressed separately from the spatial convolution.
+9. **Channel offsets** - Constant offsets are added to the output channels. This is used by transformations such as inversion.
+10. **Scaling** - The channel values are divided by the configured scaling factor. Division by 256 is implemented as an arithmetic shift, while division by 9 uses a fixed-point reciprocal approximation.
+11. **Absolute value** - Filters that produce signed edge responses can optionally convert the result to its absolute value.
+12. **Clamping** - Values are clamped to the valid 8-bit range of 0–255.
+13. **Output formatting** - The resulting RGB channels are packed into the format expected by the RGB2DVI output stage, along with the delayed video timing signals.
 
 ## Design implementation
 
@@ -331,17 +336,17 @@ The block diagram for the hardware configuration can be seen here:
 
 ## Performance
 
-The video pipeline is designed to process one pixel per pixel-clock cycle after pipeline filling. The initail fill takes ~4400 clock cycles, but this is a one-time cost. Once the pipeline is filled, an output pixel will arrive every clock cylce.
+The video pipeline is designed to process one pixel per pixel-clock cycle after pipeline filling. The initial fill takes ~4400 clock cycles, but this is a one-time cost. Once the pipeline is filled, an output pixel will arrive every clock cycle.
 
 Software rendering performance depends on the amount of framebuffer data modified by the application. Drawing operations that modify relatively small portions of the framebuffer can avoid rewriting the entire display.
 
 Compiler optimization also has a significant effect on software rendering performance. The rendering times are as follows:
 
-Frame mode with no optimizations:
+Full frame mode with no optimizations:
 
 ![Optimization_0_FRAME_MODE](/images/Optimization_0_FRAME_MODE.png)
 
-Frame mode with o1 optimizations:
+Full frame mode with o1 optimizations:
 
 ![Optimization_1_FRAME_MODE](/images/Optimization_1_FRAME_MODE.png)
 
@@ -357,7 +362,7 @@ In general, the incremental drawing mode requires ~30 ms to perform a memcpy ope
 
 ## Results
 
-The following results are obtained by toggling the push button after loading a frame into memory using the graphics libary. In this case, there are two images, some simple text, and some shapes.
+The following results are obtained by toggling the push button after loading a frame into memory using the graphics library. In this case, there are two images, some simple text, and some shapes.
 
 ### Unfiltered Image
 
@@ -398,7 +403,7 @@ This is the unmodified output of the VDMA controller. The monitor menu confirms 
 
 ![resource_utilization](/images/resource_utilization.png)
 
-Since the design was able to infer BRAM for the line buffers and DSPs for the multiply and accumualte operations, resource utilization remains relatively low for LUTs, LUTRAM, and FFs. When BRAM was not inferred for the line buffers, almost all of the LUTRAM was wasted implementing them.
+Since the design was able to infer BRAM for the line buffers and DSPs for the multiply and accumulate operations, resource utilization remains relatively low for LUTs, LUTRAM, and FFs. When BRAM was not inferred for the line buffers, almost all of the LUTRAM was wasted implementing them.
 
 ### Vivado
 
@@ -433,8 +438,9 @@ Attempting to obtain multiple adjacent pixels from a single line-buffer memory m
 
 ### DSP Inference
 
-The convolution requires a large number of parallel multiplications. Explicitly encouraging Vivado to map these operations onto DSP48 resources substantially improved the timing of the multiplication stages.
-This was preferable to attempting to replace the arbitrary kernel multiplications with shift/add logic, since the kernel coefficients are configurable.
+The convolution performs 27 parallel pixel/channel multiplications: nine kernel weights for each of the three RGB channels. The colour-channel transformation introduces an additional nine multiplications.
+
+The convolution multipliers were explicitly encouraged to use DSP48 resources with Vivado's `use_dsp` attribute. This substantially improved timing compared with the implementation in which Vivado did not map the multiplications to DSP resources.
 
 ### Pipeline Design
 
@@ -446,7 +452,7 @@ Large arithmetic operations therefore need to be distributed across multiple pip
 
 A conventional division operation by a constant introduced significant timing delay (in particular, division by 9 for the blur filter).
 
-The division was replaced with a fixed-point reciprocal multiplication approach for the applicable filter operation, allowing the operation to be implemented using FPGA-friendly arithmetic. Other filters used powers of 2 for the division (such as 256) or 1, so in thoses cases the division could be simplified to an arithmetic right shift or nothing in the case of a division value of 1.
+The division was replaced with a fixed-point reciprocal multiplication approach for the applicable filter operation ( x / 9 ≈ (7282 * x) / 65536), allowing the operation to be implemented using FPGA-friendly arithmetic. Other filters used powers of 2 for the division (such as 256) or 1, so in those cases the division could be simplified to an arithmetic right shift or nothing in the case of a division value of 1.
 
 ### Timing
 
