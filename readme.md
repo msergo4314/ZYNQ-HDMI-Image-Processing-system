@@ -289,17 +289,17 @@ Main implementation of the ZHDMI graphics library.
 
 Responsibilities include:
 
-VDMA initialization
-Framebuffer allocation
-Triple-buffer management
-Pixel operations
-Line and shape drawing
-Text rendering
-Image rendering
-Display orientation
-Framebuffer refresh
-Dirty-region tracking
-Display state management
+- VDMA initialization
+- Framebuffer allocation
+- Triple-buffer management
+- Pixel operations
+- Line and shape drawing
+- Text rendering
+- Image rendering
+- Display orientation
+- Framebuffer refresh
+- Dirty-region tracking
+- Display state management
 
 The library maintains the current framebuffer state internally and exposes a higher-level drawing API to the application.
 
